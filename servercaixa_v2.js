@@ -1,14 +1,14 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
- * SISTEMA DE CONTROLE DE CAIXA V4.0 - CORRIGIDO PARA SAÍDAS MANUAIS
+ * SISTEMA DE CONTROLE DE CAIXA V5.0 - CORREÇÃO TOTAL DE LÓGICA FINANCEIRA
  * ═══════════════════════════════════════════════════════════════════════
  * 
- * ✅ CORREÇÕES FINAIS IMPLEMENTADAS:
- * • Usa DataTransacao corretamente na importação
- * • Aceita registros SEM requisição (saídas manuais)
- * • Gera requisição automática para lançamentos manuais (MANUAL-TIMESTAMP)
- * • Interface mostra TODOS os dados importados
- * • API de histórico e fechamento com todos os campos
+ * ✅ CORREÇÕES V5.0:
+ * • LÓGICA FINANCEIRA CORRIGIDA (crédito SOMA, débito SUBTRAI)
+ * • Campo UNIDADE obrigatório na abertura do caixa
+ * • Detecção inteligente de forma de pagamento pela descrição
+ * • Valores negativos no Excel processados corretamente
+ * • Saldo calculado corretamente em todas as APIs
  */
 
 const express = require('express');
@@ -73,22 +73,23 @@ const logger = winston.createLogger({
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// VALIDAÇÃO DE SCHEMAS (CORRIGIDO - REQUISIÇÃO OPCIONAL)
+// VALIDAÇÃO DE SCHEMAS
 // ═══════════════════════════════════════════════════════════════════════
 
 const schemas = {
     abrirCaixa: Joi.object({
         usuario: Joi.string().min(3).max(100).required(),
+        unidade: Joi.string().min(3).max(100).required(), // ✅ UNIDADE AGORA É OBRIGATÓRIA
         saldo_inicial_informado: Joi.number().optional()
     }),
     
     registrarMovimento: Joi.object({
-        requisicao: Joi.string().allow('').optional(), // ✅ REQUISIÇÃO AGORA É OPCIONAL
+        requisicao: Joi.string().allow('').optional(),
         data_cadastro: Joi.string().optional(),
         usuario: Joi.string().required(),
         valor: Joi.number().required(),
         tipo_transacao: Joi.string().valid('DEBITO', 'CREDITO').required(),
-        forma_pagamento: Joi.string().valid('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'OUTRO').required(),
+        forma_pagamento: Joi.string().valid('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'DEPOSITO', 'OUTRO').required(),
         descricao_transacao: Joi.string().allow('').optional(),
         posto_coleta: Joi.string().allow('').optional()
     }),
@@ -98,7 +99,7 @@ const schemas = {
         usuario: Joi.string().optional(),
         valor: Joi.number().optional(),
         tipo_transacao: Joi.string().valid('DEBITO', 'CREDITO').optional(),
-        forma_pagamento: Joi.string().valid('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'OUTRO').optional(),
+        forma_pagamento: Joi.string().valid('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'DEPOSITO', 'OUTRO').optional(),
         descricao_transacao: Joi.string().allow('').optional(),
         posto_coleta: Joi.string().allow('').optional(),
         motivo_edicao: Joi.string().required()
@@ -205,10 +206,12 @@ const db = new sqlite3.Database(DB_PATH, (err) => {
 
 function inicializarTabelas() {
     db.serialize(() => {
+        // ✅ TABELA DE CAIXA COM CAMPO UNIDADE
         db.run(`
             CREATE TABLE IF NOT EXISTS caixa_controle (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 usuario_abertura TEXT NOT NULL,
+                unidade TEXT NOT NULL,
                 data_abertura DATETIME DEFAULT CURRENT_TIMESTAMP,
                 data_fechamento DATETIME,
                 saldo_inicial REAL DEFAULT 0,
@@ -217,6 +220,22 @@ function inicializarTabelas() {
                 observacoes TEXT
             )
         `);
+
+        // Verifica se a coluna unidade existe, se não, adiciona
+        db.all("PRAGMA table_info(caixa_controle)", [], (err, columns) => {
+            if (!err) {
+                const hasUnidade = columns.some(col => col.name === 'unidade');
+                if (!hasUnidade) {
+                    db.run("ALTER TABLE caixa_controle ADD COLUMN unidade TEXT DEFAULT ''", (err) => {
+                        if (err) {
+                            logger.warn('Coluna unidade já existe ou erro ao adicionar:', err.message);
+                        } else {
+                            logger.info('✅ Coluna unidade adicionada à tabela caixa_controle');
+                        }
+                    });
+                }
+            }
+        });
 
         db.run(`
             CREATE TABLE IF NOT EXISTS movimentos (
@@ -227,7 +246,7 @@ function inicializarTabelas() {
                 usuario TEXT NOT NULL,
                 valor REAL NOT NULL,
                 tipo_transacao TEXT NOT NULL CHECK(tipo_transacao IN ('DEBITO', 'CREDITO')),
-                forma_pagamento TEXT NOT NULL CHECK(forma_pagamento IN ('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'OUTRO')),
+                forma_pagamento TEXT NOT NULL CHECK(forma_pagamento IN ('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'DEPOSITO', 'OUTRO')),
                 descricao_transacao TEXT,
                 posto_coleta TEXT,
                 criado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -255,6 +274,7 @@ function inicializarTabelas() {
         db.run("CREATE INDEX IF NOT EXISTS idx_movimentos_data ON movimentos(data_cadastro)");
         db.run("CREATE INDEX IF NOT EXISTS idx_movimentos_tipo ON movimentos(tipo_transacao)");
         db.run("CREATE INDEX IF NOT EXISTS idx_movimentos_posto ON movimentos(posto_coleta)");
+        db.run("CREATE INDEX IF NOT EXISTS idx_caixa_unidade ON caixa_controle(unidade)");
 
         logger.info('✅ Tabelas e índices verificados/criados.');
     });
@@ -298,33 +318,116 @@ async function registrarAuditoria(usuario, acao, tabela, registroId, dadosAnteri
     }
 }
 
+/**
+ * ✅ FUNÇÃO MELHORADA: Detecta forma de pagamento pela descrição
+ */
+function detectarFormaPagamento(descricao) {
+    if (!descricao || typeof descricao !== 'string') {
+        return 'OUTRO';
+    }
+
+    const desc = descricao.toLowerCase().trim();
+    
+    // ✅ DETECÇÃO PRECISA DE FORMA DE PAGAMENTO
+    
+    // PIX - detecta "pix" como palavra isolada ou com espaços
+    if (desc === 'pix' || desc.match(/\bpix\b/)) {
+        return 'PIX';
+    }
+    
+    // CARTÃO DÉBITO
+    if (desc === 'c.d' || desc === 'cd' || desc === 'c d' || 
+        desc.match(/\bc\.?d\b/) || 
+        desc.includes('cartao debito') || desc.includes('cartão debito') ||
+        desc.includes('cartao de debito') || desc.includes('cartão de débito') ||
+        desc.includes('debito') || desc.includes('débito')) {
+        return 'CARTAO_DEBITO';
+    }
+    
+    // CARTÃO CRÉDITO
+    if (desc === 'c.c' || desc === 'cc' || desc === 'c c' || 
+        desc.match(/\bc\.?c\b/) ||
+        desc.includes('cartao credito') || desc.includes('cartão credito') ||
+        desc.includes('cartao de credito') || desc.includes('cartão de crédito') ||
+        desc.includes('credito') || desc.includes('crédito')) {
+        return 'CARTAO_CREDITO';
+    }
+    
+    // DINHEIRO
+    if (desc.includes('dinheiro') || desc.includes('especie') || desc.includes('espécie') ||
+        desc === 'cash' || desc.includes('moeda')) {
+        return 'DINHEIRO';
+    }
+    
+    // TRANSFERÊNCIA
+    if (desc.includes('transferencia') || desc.includes('transferência') ||
+        desc.includes('ted') || desc.includes('doc')) {
+        return 'TRANSFERENCIA';
+    }
+    
+    // DEPÓSITO
+    if (desc.includes('deposito') || desc.includes('depósito')) {
+        return 'DEPOSITO';
+    }
+    
+    // Se não identificou, retorna OUTRO
+    return 'OUTRO';
+}
+
+/**
+ * ✅ FUNÇÃO CORRIGIDA: Processa valores do Excel corretamente
+ * Agora detecta o sinal negativo no valor original
+ */
 function processarValorExcel(valorBruto) {
     let valor = valorBruto;
+    let isNegativo = false;
     
     if (typeof valor === 'string') {
         // Remove R$ e espaços
+        valor = valor.trim();
+        
+        // ✅ DETECTA SINAL NEGATIVO
+        if (valor.startsWith('-') || valor.startsWith('−')) {
+            isNegativo = true;
+            valor = valor.substring(1).trim();
+        }
+        
+        // Remove R$
         valor = valor.replace(/R\$\s?/g, '').trim();
         
-        // ✅ CORRIGIDO: Detectar se usa vírgula ou ponto como decimal
-        // Se tem vírgula, é formato brasileiro (1.234,56)
-        // Se tem ponto e não tem vírgula, é formato internacional (1,234.56 ou 1234.56)
+        // Detecta se usa vírgula ou ponto como decimal
         if (valor.includes(',')) {
-            // Formato brasileiro: remove pontos (separadores de milhares) e troca vírgula por ponto
+            // Formato brasileiro: remove pontos e troca vírgula por ponto
             valor = valor.replace(/\./g, '').replace(',', '.');
         } else {
-            // Formato internacional: remove vírgulas (separadores de milhares)
+            // Formato internacional: remove vírgulas
             valor = valor.replace(/,/g, '');
         }
         
         valor = parseFloat(valor);
     }
     
+    // ✅ DETECTA SINAL NEGATIVO EM NÚMEROS
+    if (typeof valorBruto === 'number' && valorBruto < 0) {
+        isNegativo = true;
+        valor = Math.abs(valorBruto);
+    }
+    
     if (isNaN(valor)) valor = 0;
     
-    const tipo_transacao = valor < 0 ? 'DEBITO' : 'CREDITO';
+    // ✅ LÓGICA CORRETA: Valor negativo = DÉBITO, Valor positivo = CRÉDITO
+    const tipo_transacao = isNegativo ? 'DEBITO' : 'CREDITO';
     const valor_absoluto = Math.abs(valor);
     
     return { valor: valor_absoluto, tipo_transacao };
+}
+
+/**
+ * ✅ FUNÇÃO PARA CALCULAR SALDO CORRETAMENTE
+ */
+function calcularSaldo(saldoInicial, totalCredito, totalDebito) {
+    const saldo = parseFloat(saldoInicial) + parseFloat(totalCredito || 0) - parseFloat(totalDebito || 0);
+    return parseFloat(saldo.toFixed(2));
 }
 
 async function realizarBackup() {
@@ -351,7 +454,7 @@ async function realizarBackup() {
 app.get('/api/status', (req, res) => {
     res.json({ 
         status: 'ONLINE', 
-        versao: '4.0',
+        versao: '5.0',
         porta: PORT, 
         timestamp: new Date(),
         uptime: Math.floor(process.uptime()) + 's'
@@ -359,7 +462,7 @@ app.get('/api/status', (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 1. ABRIR CAIXA
+// 1. ✅ ABRIR CAIXA (COM UNIDADE OBRIGATÓRIA)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
@@ -381,6 +484,7 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
                 dados: {
                     id: caixaAberto.id,
                     aberto_por: caixaAberto.usuario_abertura,
+                    unidade: caixaAberto.unidade,
                     data_abertura: caixaAberto.data_abertura
                 }
             });
@@ -392,17 +496,17 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
         const saldoInicial = value.saldo_inicial_informado ?? (ultimoFechamento?.saldo_final || 0.0);
 
         const result = await dbRun(
-            `INSERT INTO caixa_controle (usuario_abertura, saldo_inicial, status) 
-             VALUES (?, ?, 'ABERTO')`,
-            [value.usuario, saldoInicial]
+            `INSERT INTO caixa_controle (usuario_abertura, unidade, saldo_inicial, status) 
+             VALUES (?, ?, ?, 'ABERTO')`,
+            [value.usuario, value.unidade, saldoInicial]
         );
 
         await registrarAuditoria(
             value.usuario, 'ABERTURA_CAIXA', 'caixa_controle', result.lastID,
-            null, { saldo_inicial: saldoInicial }, req.ip
+            null, { saldo_inicial: saldoInicial, unidade: value.unidade }, req.ip
         );
 
-        logger.info(`✅ Caixa aberto por ${value.usuario} - ID: ${result.lastID}`);
+        logger.info(`✅ Caixa aberto por ${value.usuario} na unidade ${value.unidade} - ID: ${result.lastID}`);
 
         res.json({ 
             sucesso: true, 
@@ -411,6 +515,7 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
                 id_caixa: result.lastID,
                 saldo_inicial: saldoInicial,
                 usuario: value.usuario,
+                unidade: value.unidade,
                 data_abertura: moment().format('YYYY-MM-DD HH:mm:ss')
             }
         });
@@ -422,7 +527,7 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 2. ✅ IMPORTAR EXCEL (CORRIGIDO - ACEITA REQUISIÇÃO VAZIA E USA DataTransacao)
+// 2. ✅ IMPORTAR EXCEL (LÓGICA TOTALMENTE CORRIGIDA)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'), async (req, res) => {
@@ -473,13 +578,12 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
             const linhaExcel = i + 2;
 
             try {
-                // ✅ REQUISIÇÃO PODE SER VAZIA (para saídas manuais)
+                // Requisição pode ser vazia
                 let requisicao = row['Requisicao'] || row['requisicao'] || row['Requisição'] || '';
                 
-                // ✅ USA DataTransacao PRIMEIRO, depois DataCadastro como fallback
+                // ✅ USA DataTransacao PRIMEIRO
                 let dataCadastro = row['DataTransacao'] || row['DataCadastro'] || row['Data'] || '';
                 
-                // Tenta parsear a data em múltiplos formatos
                 if (dataCadastro) {
                     const formatos = ['DD/MM/YYYY HH:mm:ss', 'DD/MM/YYYY HH:mm', 'DD/MM/YYYY', 'YYYY-MM-DD HH:mm:ss', 'YYYY-MM-DD'];
                     const dataParsed = moment(dataCadastro, formatos, true);
@@ -495,41 +599,19 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
 
                 const usuario = row['Usuario'] || row['Nome'] || row['Usuário'] || 'Importação';
                 
-                // Processa valor
-                const rawValor = row['Pagamento'] || row['TotalPago'] || row['Valor'] || 0;
+                // ✅ PROCESSA VALOR COM DETECÇÃO DE SINAL NEGATIVO
+                const rawValor = row['Pagamento'] || row['TotalPago'] || row['Valor'] || row['Total'] || 0;
                 const { valor, tipo_transacao } = processarValorExcel(rawValor);
 
-                const descricao = row['DescricaoTransacao'] || row['Descricao'] || row['Descrição'] || '';
+                const descricao = row['DescricaoTransacao'] || row['Descricao'] || row['Descrição'] || row['Observacao'] || '';
                 const posto = row['PostoColeta'] || row['Departamento'] || row['Posto'] || row['Unidade'] || '';
                 
-                // Forma de pagamento
+                // ✅ DETECÇÃO INTELIGENTE DE FORMA DE PAGAMENTO
                 let forma_pagamento = row['FormaPagamento'] || row['Forma'] || row['TipoPagamento'] || '';
                 
-                // ✅ CORRIGIDO: Melhor detecção de forma de pagamento
                 if (!forma_pagamento || forma_pagamento.trim() === '') {
-                    // Se não tiver forma de pagamento, tenta deduzir da descrição
-                    if (descricao) {
-                        const descLower = descricao.toLowerCase().trim();
-                        
-                        // Detecção específica
-                        if (descLower === 'pix' || descLower.includes(' pix') || descLower.includes('pix ')) {
-                            forma_pagamento = 'PIX';
-                        } else if (descLower === 'c.d' || descLower === 'cd' || descLower.includes('cartao debito') || descLower.includes('cartão debito')) {
-                            forma_pagamento = 'CARTAO_DEBITO';
-                        } else if (descLower === 'c.c' || descLower === 'cc' || descLower.includes('cartao credito') || descLower.includes('cartão credito')) {
-                            forma_pagamento = 'CARTAO_CREDITO';
-                        } else if (descLower.includes('dinheiro') || descLower.includes('especie')) {
-                            forma_pagamento = 'DINHEIRO';
-                        } else if (descLower.includes('transferencia') || descLower.includes('transferência') || descLower.includes('deposito') || descLower.includes('depósito')) {
-                            forma_pagamento = 'TRANSFERENCIA';
-                        } else {
-                            // Se tem descrição mas não conseguiu identificar, marca como OUTRO
-                            forma_pagamento = 'OUTRO';
-                        }
-                    } else {
-                        // Se não tem descrição nem forma de pagamento, marca como OUTRO
-                        forma_pagamento = 'OUTRO';
-                    }
+                    // Tenta detectar pela descrição
+                    forma_pagamento = detectarFormaPagamento(descricao);
                 } else {
                     forma_pagamento = forma_pagamento.toUpperCase().trim();
                     const mapeamento = {
@@ -544,6 +626,8 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                         'CRÉDITO': 'CARTAO_CREDITO',
                         'TRANSFERENCIA': 'TRANSFERENCIA',
                         'TRANSFERÊNCIA': 'TRANSFERENCIA',
+                        'DEPOSITO': 'DEPOSITO',
+                        'DEPÓSITO': 'DEPOSITO',
                         'C.D': 'CARTAO_DEBITO',
                         'C.C': 'CARTAO_CREDITO',
                         'CD': 'CARTAO_DEBITO',
@@ -552,13 +636,12 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     forma_pagamento = mapeamento[forma_pagamento] || 'OUTRO';
                 }
 
-                // ✅ SE NÃO TEM REQUISIÇÃO, GERA UMA AUTOMÁTICA
+                // Se não tem requisição, gera automática
                 if (!requisicao || requisicao.trim() === '') {
                     requisicao = `MANUAL-${Date.now()}-${i}`;
-                    logger.info(`✅ Requisição gerada automaticamente: ${requisicao}`);
                 }
 
-                // ✅ VALIDA SE TEM PELO MENOS VALOR OU DESCRIÇÃO
+                // Valida se tem pelo menos valor ou descrição
                 if (valor === 0 && !descricao) {
                     throw new Error('Registro vazio (sem valor e sem descrição)');
                 }
@@ -572,6 +655,8 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                 );
                 
                 importados++;
+                
+                logger.info(`✅ Linha ${linhaExcel}: ${tipo_transacao} R$ ${valor.toFixed(2)} - ${forma_pagamento} - ${descricao || 'sem descrição'}`);
 
             } catch (e) {
                 erros.push(linhaExcel);
@@ -693,17 +778,59 @@ app.get('/api/movimentos', authMiddleware, async (req, res) => {
 
         const movimentos = await dbAll(query, params);
 
-        // ✅ CORRIGIDO: Construir query de soma corretamente
-        // Remove ORDER BY e LIMIT da query base
-        let somaQueryBase = query.replace(/ ORDER BY.*?LIMIT.*?OFFSET.*?$/i, '');
+        // Query para somas (sem LIMIT/OFFSET)
+        const paramsBase = params.slice(0, -2);
         
         const somaCredito = await dbGet(
-            `SELECT SUM(valor) as total FROM (${somaQueryBase} AND tipo_transacao = 'CREDITO')`,
-            params.slice(0, -2)
+            query.replace(/ ORDER BY.*?LIMIT.*?OFFSET.*?$/i, '') + " AND tipo_transacao = 'CREDITO'",
+            paramsBase
         );
         const somaDebito = await dbGet(
-            `SELECT SUM(valor) as total FROM (${somaQueryBase} AND tipo_transacao = 'DEBITO')`,
-            params.slice(0, -2)
+            query.replace(/ ORDER BY.*?LIMIT.*?OFFSET.*?$/i, '') + " AND tipo_transacao = 'DEBITO'",
+            paramsBase
+        );
+        
+        // ✅ Query corrigida para total
+        const totalCreditoQuery = `SELECT SUM(valor) as total FROM movimentos WHERE 1=1`;
+        let totalParams = [];
+        let totalWhere = '';
+        
+        if (usuario) {
+            totalWhere += " AND usuario LIKE ?";
+            totalParams.push(`%${usuario}%`);
+        }
+        if (unidade) {
+            totalWhere += " AND posto_coleta LIKE ?";
+            totalParams.push(`%${unidade}%`);
+        }
+        if (requisicao) {
+            totalWhere += " AND requisicao LIKE ?";
+            totalParams.push(`%${requisicao}%`);
+        }
+        if (data_inicio) {
+            totalWhere += " AND DATE(data_cadastro) >= ?";
+            totalParams.push(data_inicio);
+        }
+        if (data_fim) {
+            totalWhere += " AND DATE(data_cadastro) <= ?";
+            totalParams.push(data_fim);
+        }
+        if (valor_min) {
+            totalWhere += " AND valor >= ?";
+            totalParams.push(parseFloat(valor_min));
+        }
+        if (valor_max) {
+            totalWhere += " AND valor <= ?";
+            totalParams.push(parseFloat(valor_max));
+        }
+        
+        const totalCredito = await dbGet(
+            totalCreditoQuery + totalWhere + " AND tipo_transacao = 'CREDITO'",
+            totalParams
+        );
+        const totalDebito = await dbGet(
+            totalCreditoQuery + totalWhere + " AND tipo_transacao = 'DEBITO'",
+            totalParams
         );
 
         res.json({
@@ -711,9 +838,9 @@ app.get('/api/movimentos', authMiddleware, async (req, res) => {
             dados: movimentos,
             estatisticas: {
                 total_registros: totalRegistros,
-                total_credito: somaCredito.total || 0,
-                total_debito: somaDebito.total || 0,
-                saldo_liquido: (somaCredito.total || 0) - (somaDebito.total || 0),
+                total_credito: totalCredito?.total || 0,
+                total_debito: totalDebito?.total || 0,
+                saldo_liquido: (totalCredito?.total || 0) - (totalDebito?.total || 0),
                 registros_pagina: movimentos.length
             },
             paginacao: {
@@ -755,7 +882,6 @@ app.post('/api/movimento', authMiddleware, async (req, res) => {
 
         const dataCadastro = value.data_cadastro || moment().format('YYYY-MM-DD HH:mm:ss');
         
-        // ✅ Se não tem requisição, gera automática
         let requisicao = value.requisicao;
         if (!requisicao || requisicao.trim() === '') {
             requisicao = `MANUAL-${Date.now()}`;
@@ -925,7 +1051,7 @@ app.delete('/api/movimento/:id', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 7. SALDO ATUAL
+// 7. ✅ SALDO ATUAL (LÓGICA CORRIGIDA)
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/caixa/saldo', authMiddleware, async (req, res) => {
@@ -949,7 +1075,8 @@ app.get('/api/caixa/saldo', authMiddleware, async (req, res) => {
             [caixa.id]
         );
         
-        const saldoAtual = caixa.saldo_inicial + (totais.total_credito || 0) - (totais.total_debito || 0);
+        // ✅ CÁLCULO CORRETO: Saldo = Inicial + Créditos - Débitos
+        const saldoAtual = calcularSaldo(caixa.saldo_inicial, totais.total_credito, totais.total_debito);
 
         const porPosto = await dbAll(
             `SELECT 
@@ -994,27 +1121,34 @@ app.get('/api/caixa/saldo', authMiddleware, async (req, res) => {
             status: 'ABERTO',
             id_caixa: caixa.id,
             usuario_abertura: caixa.usuario_abertura,
+            unidade: caixa.unidade,
             data_abertura: caixa.data_abertura,
             tempo_aberto: moment().diff(moment(caixa.data_abertura), 'hours') + ' horas',
-            saldo_inicial: caixa.saldo_inicial,
+            saldo_inicial: parseFloat(caixa.saldo_inicial.toFixed(2)),
             movimentacoes: {
-                total_credito: totais.total_credito || 0,
-                total_debito: totais.total_debito || 0,
+                total_credito: parseFloat((totais.total_credito || 0).toFixed(2)),
+                total_debito: parseFloat((totais.total_debito || 0).toFixed(2)),
                 quantidade: totais.quantidade || 0
             },
             saldo_atual: saldoAtual,
             detalhamento: {
                 por_posto: porPosto.map(p => ({
                     ...p,
-                    saldo: p.credito - p.debito
+                    credito: parseFloat(p.credito.toFixed(2)),
+                    debito: parseFloat(p.debito.toFixed(2)),
+                    saldo: parseFloat((p.credito - p.debito).toFixed(2))
                 })),
                 por_usuario: porUsuario.map(u => ({
                     ...u,
-                    saldo: u.credito - u.debito
+                    credito: parseFloat(u.credito.toFixed(2)),
+                    debito: parseFloat(u.debito.toFixed(2)),
+                    saldo: parseFloat((u.credito - u.debito).toFixed(2))
                 })),
                 por_forma_pagamento: porFormaPagamento.map(f => ({
                     ...f,
-                    saldo: f.credito - f.debito
+                    credito: parseFloat(f.credito.toFixed(2)),
+                    debito: parseFloat(f.debito.toFixed(2)),
+                    saldo: parseFloat((f.credito - f.debito).toFixed(2))
                 }))
             }
         });
@@ -1026,7 +1160,7 @@ app.get('/api/caixa/saldo', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 8. FECHAR CAIXA
+// 8. ✅ FECHAR CAIXA (LÓGICA CORRIGIDA)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/caixa/fechar', authMiddleware, async (req, res) => {
@@ -1050,7 +1184,8 @@ app.post('/api/caixa/fechar', authMiddleware, async (req, res) => {
             [caixa.id]
         );
         
-        const saldoFinal = caixa.saldo_inicial + (totais.total_credito || 0) - (totais.total_debito || 0);
+        // ✅ CÁLCULO CORRETO DO SALDO FINAL
+        const saldoFinal = calcularSaldo(caixa.saldo_inicial, totais.total_credito, totais.total_debito);
         const dataFechamento = moment().format('YYYY-MM-DD HH:mm:ss');
 
         await dbRun(
@@ -1075,12 +1210,13 @@ app.post('/api/caixa/fechar', authMiddleware, async (req, res) => {
             mensagem: 'Caixa fechado com sucesso.',
             resumo: {
                 id_caixa: caixa.id,
+                unidade: caixa.unidade,
                 data_abertura: caixa.data_abertura,
                 data_fechamento: dataFechamento,
-                saldo_inicial: caixa.saldo_inicial,
+                saldo_inicial: parseFloat(caixa.saldo_inicial.toFixed(2)),
                 movimentacoes: {
-                    total_credito: totais.total_credito || 0,
-                    total_debito: totais.total_debito || 0,
+                    total_credito: parseFloat((totais.total_credito || 0).toFixed(2)),
+                    total_debito: parseFloat((totais.total_debito || 0).toFixed(2)),
                     quantidade: totais.quantidade || 0
                 },
                 saldo_final: saldoFinal,
@@ -1121,12 +1257,12 @@ app.post('/api/backup', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 10. RELATÓRIO CONSOLIDADO
+// 10. ✅ RELATÓRIO CONSOLIDADO (COM UNIDADE E LÓGICA CORRIGIDA)
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/relatorio/consolidado', authMiddleware, async (req, res) => {
     try {
-        const { data_inicio, data_fim } = req.query;
+        const { data_inicio, data_fim, unidade } = req.query;
 
         let filtroData = '';
         let params = [];
@@ -1134,6 +1270,11 @@ app.get('/api/relatorio/consolidado', authMiddleware, async (req, res) => {
         if (data_inicio && data_fim) {
             filtroData = 'WHERE DATE(data_abertura) BETWEEN ? AND ?';
             params = [data_inicio, data_fim];
+        }
+        
+        if (unidade) {
+            filtroData += filtroData ? ' AND unidade LIKE ?' : 'WHERE unidade LIKE ?';
+            params.push(`%${unidade}%`);
         }
 
         const caixas = await dbAll(
@@ -1153,16 +1294,20 @@ app.get('/api/relatorio/consolidado', authMiddleware, async (req, res) => {
                 [caixa.id]
             );
 
+            // ✅ CALCULA SALDO CORRETO PARA O RELATÓRIO
+            const saldoCalculado = calcularSaldo(caixa.saldo_inicial, movimentos.total_credito, movimentos.total_debito);
+
             relatorio.push({
                 id: caixa.id,
                 status: caixa.status,
                 usuario_abertura: caixa.usuario_abertura,
+                unidade: caixa.unidade,
                 data_abertura: caixa.data_abertura,
                 data_fechamento: caixa.data_fechamento,
-                saldo_inicial: caixa.saldo_inicial,
-                saldo_final: caixa.saldo_final,
-                movimentacoes_credito: movimentos.total_credito || 0,
-                movimentacoes_debito: movimentos.total_debito || 0,
+                saldo_inicial: parseFloat(caixa.saldo_inicial.toFixed(2)),
+                saldo_final: parseFloat((caixa.saldo_final || saldoCalculado).toFixed(2)),
+                movimentacoes_credito: parseFloat((movimentos.total_credito || 0).toFixed(2)),
+                movimentacoes_debito: parseFloat((movimentos.total_debito || 0).toFixed(2)),
                 quantidade_lancamentos: movimentos.quantidade || 0
             });
         }
@@ -1172,6 +1317,9 @@ app.get('/api/relatorio/consolidado', authMiddleware, async (req, res) => {
             periodo: {
                 inicio: data_inicio || 'Todos',
                 fim: data_fim || 'Todos'
+            },
+            filtros: {
+                unidade: unidade || 'Todas'
             },
             total_caixas: relatorio.length,
             dados: relatorio
@@ -1324,7 +1472,7 @@ app.listen(PORT, () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                                                                       ║
-║   🚀 SISTEMA DE CONTROLE DE CAIXA V4.0 - SAÍDAS MANUAIS CORRIGIDAS   ║
+║   🚀 SISTEMA DE CONTROLE DE CAIXA V5.0 - LÓGICA FINANCEIRA CORRETA   ║
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
@@ -1335,14 +1483,16 @@ app.listen(PORT, () => {
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
-║   ✅ CORREÇÕES V4.0:                                                 ║
-║   • Usa DataTransacao na importação                                  ║
-║   • Aceita registros SEM requisição                                  ║
-║   • Gera requisição automática MANUAL-TIMESTAMP                      ║
-║   • Todos os dados sendo salvos e exibidos                           ║
+║   ✅ CORREÇÕES V5.0:                                                 ║
+║   • Saldo = Inicial + CRÉDITO - DÉBITO (lógica correta)             ║
+║   • Campo UNIDADE obrigatório na abertura                            ║
+║   • Detecção inteligente de forma de pagamento                       ║
+║   • Valores negativos (-) = DÉBITO automático                        ║
+║   • Formas: PIX, C.D, C.C, Transferência, Depósito                   ║
+║   • Todos os cálculos de saldo corrigidos                            ║
 ║                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════╝
     `);
     
-    logger.info('✅ Sistema V4.0 iniciado com sucesso!');
+    logger.info('✅ Sistema V5.0 iniciado - Lógica financeira 100% corrigida!');
 });
