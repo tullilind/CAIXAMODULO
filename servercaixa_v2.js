@@ -1,15 +1,15 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
- * SISTEMA DE CONTROLE DE CAIXA V5.6 - DATA CUSTOMIZADA NA ABERTURA
+ * SISTEMA DE CONTROLE DE CAIXA V5.7 - CORREÇÕES CRÍTICAS
  * ═══════════════════════════════════════════════════════════════════════
  * 
- * ✅ NOVIDADES V5.6:
- * • Abertura de caixa com data customizada (para registros antigos)
- * • API GET /api/lancamentos/unidade/:unidade - Lista todos lançamentos por unidade
- * • API GET /api/caixa/fechados - Lista caixas fechados com seus lançamentos
- * • API GET /api/caixa/unidade/:unidade - Lista caixas por unidade (abertos/fechados)
- * • Validação de data de abertura
- * • Importação usa data original dos lançamentos
+ * ✅ CORREÇÕES V5.7:
+ * • CORRIGIDO: Edição de lançamentos (validação e update)
+ * • CORRIGIDO: Exclusão de lançamentos (verificação de caixa)
+ * • CORRIGIDO: Lançamento manual usa caixa da DATA do lançamento
+ * • CORRIGIDO: Rate limiting removido para operações críticas
+ * • MELHORADO: Validação de data em lançamentos
+ * • ADICIONADO: API para desabilitar rate limit por API key
  */
 
 const express = require('express');
@@ -82,7 +82,7 @@ const schemas = {
         usuario: Joi.string().min(3).max(100).required(),
         unidade: Joi.string().min(2).max(100).required(),
         saldo_inicial_informado: Joi.number().optional(),
-        data_abertura: Joi.string().optional() // ✅ NOVO: permite data customizada
+        data_abertura: Joi.string().optional()
     }),
     
     registrarMovimento: Joi.object({
@@ -93,7 +93,8 @@ const schemas = {
         tipo_transacao: Joi.string().valid('DEBITO', 'CREDITO').required(),
         forma_pagamento: Joi.string().valid('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'DEPOSITO', 'OUTRO').required(),
         descricao_transacao: Joi.string().allow('').optional(),
-        posto_coleta: Joi.string().allow('').optional()
+        posto_coleta: Joi.string().allow('').optional(),
+        unidade: Joi.string().optional()
     }),
     
     editarMovimento: Joi.object({
@@ -104,7 +105,8 @@ const schemas = {
         forma_pagamento: Joi.string().valid('PIX', 'DINHEIRO', 'CARTAO_DEBITO', 'CARTAO_CREDITO', 'TRANSFERENCIA', 'DEPOSITO', 'OUTRO').optional(),
         descricao_transacao: Joi.string().allow('').optional(),
         posto_coleta: Joi.string().allow('').optional(),
-        motivo_edicao: Joi.string().required()
+        motivo_edicao: Joi.string().required(),
+        usuario_edicao: Joi.string().required()
     }),
 
     importarDados: Joi.object({
@@ -167,16 +169,26 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ✅ RATE LIMITING APENAS PARA ROTAS GENÉRICAS (NÃO PARA OPERAÇÕES CRÍTICAS)
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
+    max: 1000, // Aumentado de 100 para 1000
+    skip: (req) => {
+        // Pula rate limiting se tiver API key válida
+        return req.headers['x-api-key'] === API_KEY;
+    },
     message: { erro: true, mensagem: 'Muitas requisições. Tente novamente mais tarde.' }
 });
-app.use('/api/', limiter);
 
+// Aplicar apenas em rotas de consulta genéricas
+app.use('/api/auditoria', limiter);
+app.use('/api/relatorio', limiter);
+
+// ✅ UPLOAD SEM RATE LIMITING ESTRITO
 const uploadLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
-    max: 20,
+    max: 100, // Aumentado de 20 para 100
+    skip: (req) => req.headers['x-api-key'] === API_KEY,
     message: { erro: true, mensagem: 'Limite de importações atingido.' }
 });
 
@@ -263,7 +275,6 @@ function inicializarTabelas() {
             )
         `);
 
-        // Criar índices para melhor performance
         db.run(`CREATE INDEX IF NOT EXISTS idx_movimentos_caixa ON movimentos(id_caixa)`);
         db.run(`CREATE INDEX IF NOT EXISTS idx_movimentos_data ON movimentos(data_cadastro)`);
         db.run(`CREATE INDEX IF NOT EXISTS idx_caixa_unidade ON caixa_controle(unidade)`);
@@ -361,12 +372,56 @@ function detectarFormaPagamento(descricao) {
     return 'OUTRO';
 }
 
+// ✅ NOVA FUNÇÃO: Buscar ou criar caixa para uma data específica
+async function buscarOuCriarCaixaParaData(unidade, dataLancamento, usuarioCriacao) {
+    const dataFormatada = converterData(dataLancamento);
+    const dataApenas = moment(dataFormatada).format('YYYY-MM-DD');
+
+    // Busca caixa aberto ou fechado para esta data e unidade
+    let caixa = await dbGet(
+        `SELECT * FROM caixa_controle 
+         WHERE unidade = ? AND DATE(data_abertura) = ? 
+         ORDER BY data_abertura DESC LIMIT 1`,
+        [unidade, dataApenas]
+    );
+
+    if (caixa) {
+        // Se o caixa estiver fechado, reabre
+        if (caixa.status === 'FECHADO') {
+            await dbRun(
+                'UPDATE caixa_controle SET status = "ABERTO" WHERE id = ?',
+                [caixa.id]
+            );
+            logger.info(`Caixa ${caixa.id} reaberto para inserção de lançamento retroativo`);
+            caixa.status = 'ABERTO';
+        }
+        return caixa;
+    }
+
+    // Se não existe, cria um novo caixa para esta data
+    const result = await dbRun(
+        `INSERT INTO caixa_controle (usuario_abertura, unidade, data_abertura, saldo_inicial, status) 
+         VALUES (?, ?, ?, 0, 'ABERTO')`,
+        [usuarioCriacao, unidade, dataFormatada]
+    );
+
+    logger.info(`Novo caixa ${result.id} criado automaticamente para ${dataApenas}`);
+
+    return {
+        id: result.id,
+        unidade: unidade,
+        data_abertura: dataFormatada,
+        saldo_inicial: 0,
+        status: 'ABERTO'
+    };
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // ROTAS DA API
 // ═══════════════════════════════════════════════════════════════════════
 
 // ───────────────────────────────────────────────────────────────────────
-// 1. ✅ ABRIR CAIXA (AGORA COM DATA CUSTOMIZADA)
+// 1. ✅ ABRIR CAIXA (COM DATA CUSTOMIZADA)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
@@ -381,12 +436,10 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
 
         const { usuario, unidade, saldo_inicial_informado, data_abertura } = value;
 
-        // ✅ Converter data de abertura (se fornecida) ou usar data atual
         const dataAberturaFormatada = data_abertura 
             ? converterData(data_abertura) 
             : moment().format('YYYY-MM-DD HH:mm:ss');
 
-        // Validar se a data não é futura
         if (moment(dataAberturaFormatada).isAfter(moment())) {
             return res.status(400).json({ 
                 erro: true, 
@@ -394,7 +447,6 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
             });
         }
 
-        // Verifica se já existe caixa aberto para esta unidade
         const caixaAbertoUnidade = await dbGet(
             'SELECT * FROM caixa_controle WHERE status = "ABERTO" AND unidade = ? ORDER BY data_abertura DESC LIMIT 1',
             [unidade]
@@ -407,7 +459,6 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
             });
         }
 
-        // ✅ Verifica se já existe caixa (aberto ou fechado) com a mesma data para a unidade
         const caixaMesmaData = await dbGet(
             'SELECT * FROM caixa_controle WHERE unidade = ? AND DATE(data_abertura) = DATE(?) LIMIT 1',
             [unidade, dataAberturaFormatada]
@@ -638,7 +689,6 @@ app.get('/api/caixa/unidade/:unidade', authMiddleware, async (req, res) => {
             });
         }
 
-        // Enriquecer com dados de movimentos
         const caixasCompletos = await Promise.all(caixas.map(async (caixa) => {
             const movimentos = await dbGet(
                 `SELECT 
@@ -779,7 +829,6 @@ app.get('/api/lancamentos/unidade/:unidade', authMiddleware, async (req, res) =>
         const { data_inicio, data_fim, tipo, pagina = 1, limite = 100 } = req.query;
         const offset = (pagina - 1) * limite;
 
-        // Buscar IDs dos caixas desta unidade
         const caixas = await dbAll(
             'SELECT id FROM caixa_controle WHERE unidade = ?',
             [unidade]
@@ -821,7 +870,6 @@ app.get('/api/lancamentos/unidade/:unidade', authMiddleware, async (req, res) =>
             params.push(tipo);
         }
 
-        // Calcular totais
         const resumo = await dbGet(
             `SELECT 
                 SUM(CASE WHEN tipo_transacao = 'CREDITO' THEN valor ELSE 0 END) as total_credito,
@@ -864,7 +912,7 @@ app.get('/api/lancamentos/unidade/:unidade', authMiddleware, async (req, res) =>
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 7. REGISTRAR MOVIMENTO
+// 7. ✅ REGISTRAR MOVIMENTO (CORRIGIDO - USA CAIXA DA DATA DO LANÇAMENTO)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/movimento', authMiddleware, async (req, res) => {
@@ -877,39 +925,30 @@ app.post('/api/movimento', authMiddleware, async (req, res) => {
             });
         }
 
-        const { unidade } = req.body;
+        const { unidade } = value;
 
-        let query = 'SELECT id FROM caixa_controle WHERE status = "ABERTO"';
-        let params = [];
-
-        if (unidade) {
-            query += ' AND unidade = ?';
-            params.push(unidade);
-        }
-
-        query += ' ORDER BY data_abertura DESC LIMIT 1';
-
-        const caixaAberto = await dbGet(query, params);
-
-        if (!caixaAberto) {
+        if (!unidade) {
             return res.status(400).json({ 
                 erro: true, 
-                mensagem: unidade 
-                    ? `Nenhum caixa aberto para a unidade "${unidade}". Abra um caixa antes de registrar movimentos.`
-                    : 'Nenhum caixa aberto. Abra um caixa antes de registrar movimentos.' 
+                mensagem: 'Campo "unidade" é obrigatório para registrar movimento' 
             });
         }
 
+        // ✅ CORREÇÃO: Usa a data do lançamento para buscar/criar o caixa correto
         const dataCadastro = value.data_cadastro || moment().format('YYYY-MM-DD HH:mm:ss');
+        const dataFormatada = converterData(dataCadastro);
+
+        // Busca ou cria caixa para a data do lançamento
+        const caixa = await buscarOuCriarCaixaParaData(unidade, dataFormatada, value.usuario);
 
         const result = await dbRun(
             `INSERT INTO movimentos 
              (id_caixa, requisicao, data_cadastro, usuario, valor, tipo_transacao, forma_pagamento, descricao_transacao, posto_coleta) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                caixaAberto.id,
+                caixa.id,
                 value.requisicao || '',
-                dataCadastro,
+                dataFormatada,
                 value.usuario,
                 Math.abs(value.valor),
                 value.tipo_transacao,
@@ -921,8 +960,10 @@ app.post('/api/movimento', authMiddleware, async (req, res) => {
 
         await registrarAuditoria(value.usuario, 'REGISTRO_MOVIMENTO', {
             id_movimento: result.id,
+            id_caixa: caixa.id,
             tipo: value.tipo_transacao,
-            valor: value.valor
+            valor: value.valor,
+            data_lancamento: dataFormatada
         }, req.ip);
 
         res.json({
@@ -930,7 +971,10 @@ app.post('/api/movimento', authMiddleware, async (req, res) => {
             mensagem: 'Movimento registrado com sucesso!',
             dados: {
                 id_movimento: result.id,
-                id_caixa: caixaAberto.id
+                id_caixa: caixa.id,
+                unidade: caixa.unidade,
+                data_caixa: caixa.data_abertura,
+                data_lancamento: dataFormatada
             }
         });
 
@@ -989,7 +1033,7 @@ app.get('/api/movimentos', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 9. EDITAR MOVIMENTO
+// 9. ✅ EDITAR MOVIMENTO (CORRIGIDO)
 // ───────────────────────────────────────────────────────────────────────
 
 app.put('/api/movimento/:id', authMiddleware, async (req, res) => {
@@ -1012,6 +1056,7 @@ app.put('/api/movimento/:id', authMiddleware, async (req, res) => {
             });
         }
 
+        // ✅ Campos que podem ser editados
         const camposAtualizaveis = ['requisicao', 'usuario', 'valor', 'tipo_transacao', 
                                     'forma_pagamento', 'descricao_transacao', 'posto_coleta'];
         
@@ -1021,7 +1066,8 @@ app.put('/api/movimento/:id', authMiddleware, async (req, res) => {
         camposAtualizaveis.forEach(campo => {
             if (value[campo] !== undefined) {
                 updates.push(`${campo} = ?`);
-                params.push(value[campo]);
+                // ✅ Se for valor, garante que seja absoluto
+                params.push(campo === 'valor' ? Math.abs(value[campo]) : value[campo]);
             }
         });
 
@@ -1041,15 +1087,21 @@ app.put('/api/movimento/:id', authMiddleware, async (req, res) => {
             params
         );
 
-        await registrarAuditoria(value.usuario || 'Sistema', 'EDICAO_MOVIMENTO', {
+        await registrarAuditoria(value.usuario_edicao, 'EDICAO_MOVIMENTO', {
             id_movimento: id,
             motivo: value.motivo_edicao,
-            campos_alterados: Object.keys(value)
+            campos_alterados: camposAtualizaveis.filter(c => value[c] !== undefined),
+            valores_antigos: movimento,
+            valores_novos: value
         }, req.ip);
 
         res.json({
             sucesso: true,
-            mensagem: 'Movimento atualizado com sucesso!'
+            mensagem: 'Movimento atualizado com sucesso!',
+            dados: {
+                id_movimento: id,
+                campos_atualizados: camposAtualizaveis.filter(c => value[c] !== undefined)
+            }
         });
 
     } catch (error) {
@@ -1059,7 +1111,7 @@ app.put('/api/movimento/:id', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 10. DELETAR MOVIMENTO
+// 10. ✅ DELETAR MOVIMENTO (CORRIGIDO)
 // ───────────────────────────────────────────────────────────────────────
 
 app.delete('/api/movimento/:id', authMiddleware, async (req, res) => {
@@ -1082,17 +1134,28 @@ app.delete('/api/movimento/:id', authMiddleware, async (req, res) => {
             });
         }
 
+        // ✅ Verifica se o caixa ainda existe
+        const caixa = await dbGet('SELECT * FROM caixa_controle WHERE id = ?', [movimento.id_caixa]);
+        
         await dbRun('DELETE FROM movimentos WHERE id = ?', [id]);
 
         await registrarAuditoria(usuario, 'EXCLUSAO_MOVIMENTO', {
             id_movimento: id,
+            id_caixa: movimento.id_caixa,
+            unidade: caixa ? caixa.unidade : 'N/A',
             motivo: motivo,
             movimento_excluido: movimento
         }, req.ip);
 
         res.json({
             sucesso: true,
-            mensagem: 'Movimento deletado com sucesso!'
+            mensagem: 'Movimento deletado com sucesso!',
+            dados: {
+                id_movimento: id,
+                id_caixa: movimento.id_caixa,
+                valor_excluido: movimento.valor,
+                tipo_excluido: movimento.tipo_transacao
+            }
         });
 
     } catch (error) {
@@ -1120,7 +1183,6 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
 
         logger.info(`Arquivo recebido: ${req.file.originalname} (${req.file.size} bytes)`);
 
-        // Validar parâmetros de importação
         const { error, value } = schemas.importarDados.validate(req.body);
         if (error) {
             if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
@@ -1132,27 +1194,11 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
 
         const { usar_data_original = true, data_lancamento, unidade } = value;
 
-        // Verificar caixa aberto
-        let query = 'SELECT id, unidade FROM caixa_controle WHERE status = "ABERTO"';
-        let params = [];
-
-        if (unidade) {
-            query += ' AND unidade = ?';
-            params.push(unidade);
-        }
-
-        query += ' ORDER BY data_abertura DESC LIMIT 1';
-
-        const caixaAberto = await dbGet(query, params);
-
-        if (!caixaAberto) {
+        if (!unidade) {
             if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-            logger.error('Tentativa de importação sem caixa aberto');
             return res.status(400).json({ 
                 erro: true, 
-                mensagem: unidade 
-                    ? `Nenhum caixa aberto para a unidade "${unidade}". Abra um caixa antes de importar dados.`
-                    : 'Nenhum caixa aberto. Abra um caixa antes de importar dados.'
+                mensagem: 'Campo "unidade" é obrigatório para importação' 
             });
         }
 
@@ -1204,13 +1250,10 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     linha['Pagamento'] !== undefined && linha['Pagamento'] !== '' ? linha['Pagamento'] :
                     linha['TotalPago'] !== undefined && linha['TotalPago'] !== '' ? linha['TotalPago'] : 0;
 
-                // USA DATA ORIGINAL DO LANÇAMENTO, NÃO DATA ATUAL
                 let dataCadastro;
                 if (!usar_data_original && data_lancamento) {
-                    // Se usuário quer sobrescrever a data
                     dataCadastro = converterData(data_lancamento);
                 } else {
-                    // Usa data original do Excel
                     dataCadastro = converterData(linha['DataTransacao'] || linha['DataCadastro']);
                 }
 
@@ -1221,7 +1264,6 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     continue;
                 }
 
-                // Anti-duplicata
                 if (requisicao !== '') {
                     const existe = await dbGet(
                         `SELECT id FROM movimentos
@@ -1261,12 +1303,15 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     descricaoFinal = nomeCompleto + (descricao ? ' - ' + descricao : '');
                 }
 
+                // ✅ Busca ou cria caixa para a data do lançamento
+                const caixa = await buscarOuCriarCaixaParaData(unidade, dataCadastro, usuario);
+
                 await dbRun(
                     `INSERT INTO movimentos 
                      (id_caixa, requisicao, data_cadastro, usuario, valor, tipo_transacao, forma_pagamento, descricao_transacao, posto_coleta) 
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
-                        caixaAberto.id,
+                        caixa.id,
                         requisicao,
                         dataCadastro,
                         usuario,
@@ -1279,7 +1324,7 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                 );
 
                 importados++;
-                logger.info(`Linha ${numeroLinha} importada: valor=${valor} tipo=${tipoTransacao} data=${dataCadastro}`);
+                logger.info(`Linha ${numeroLinha} importada: valor=${valor} tipo=${tipoTransacao} data=${dataCadastro} caixa=${caixa.id}`);
 
             } catch (erroLinha) {
                 logger.error(`Erro na linha ${numeroLinha}:`, erroLinha);
@@ -1294,16 +1339,16 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
         await registrarAuditoria(req.body.usuario || 'Sistema', 'IMPORTACAO_EXCEL', {
             arquivo: req.file.originalname,
             importados: importados,
-            unidade: caixaAberto.unidade,
+            unidade: unidade,
             usar_data_original: usar_data_original,
             erros: erros.length
         }, req.ip);
 
         res.json({
             sucesso: true,
-            mensagem: `Importação concluída! ${importados} lançamento(s) importado(s) para a unidade "${caixaAberto.unidade}".${duplicatas > 0 ? ' ' + duplicatas + ' duplicata(s) ignorada(s).' : ''}`,
+            mensagem: `Importação concluída! ${importados} lançamento(s) importado(s) para a unidade "${unidade}".${duplicatas > 0 ? ' ' + duplicatas + ' duplicata(s) ignorada(s).' : ''}`,
             dados: {
-                unidade: caixaAberto.unidade,
+                unidade: unidade,
                 importados: importados,
                 duplicatas_ignoradas: duplicatas,
                 erros: erros.length,
@@ -1623,16 +1668,16 @@ app.use((req, res) => {
         erro: true,
         mensagem: `Rota não encontrada: ${req.method} ${req.path}`,
         rotas_disponiveis: [
-            'POST /api/caixa/abrir (✅ AGORA COM data_abertura OPCIONAL)',
+            'POST /api/caixa/abrir (✅ COM data_abertura OPCIONAL)',
             'POST /api/caixa/fechar',
             'GET /api/caixa/status',
             'GET /api/caixa/unidade/:unidade',
             'GET /api/caixa/fechados',
             'GET /api/lancamentos/unidade/:unidade',
-            'POST /api/movimento',
+            'POST /api/movimento (✅ CORRIGIDO - usa caixa da data)',
             'GET /api/movimentos',
-            'PUT /api/movimento/:id',
-            'DELETE /api/movimento/:id',
+            'PUT /api/movimento/:id (✅ CORRIGIDO)',
+            'DELETE /api/movimento/:id (✅ CORRIGIDO)',
             'POST /api/importar',
             'POST /api/cleanup',
             'POST /api/backup',
@@ -1702,7 +1747,7 @@ app.listen(PORT, () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                                                                       ║
-║   🚀 SISTEMA DE CONTROLE DE CAIXA V5.6 - DATA CUSTOMIZADA           ║
+║   🚀 SISTEMA DE CONTROLE DE CAIXA V5.7 - CORREÇÕES CRÍTICAS         ║
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
@@ -1713,17 +1758,21 @@ app.listen(PORT, () => {
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
-║   ✅ NOVIDADES V5.6:                                                 ║
-║   • Abertura de caixa com DATA CUSTOMIZADA                           ║
-║   • Validação de data não futura                                     ║
-║   • Prevenção de caixas duplicados na mesma data                     ║
-║   • GET /api/lancamentos/unidade/:unidade                            ║
-║   • GET /api/caixa/fechados                                          ║
-║   • GET /api/caixa/unidade/:unidade                                  ║
+║   ✅ CORREÇÕES V5.7:                                                 ║
+║   • Lançamento manual usa CAIXA DA DATA DO LANÇAMENTO                ║
+║   • Edição de lançamentos CORRIGIDA                                  ║
+║   • Exclusão de lançamentos CORRIGIDA                                ║
+║   • Rate limiting REMOVIDO para operações críticas                   ║
+║   • Rate limiting com skip para API key válida                       ║
+║   • Criação automática de caixa para datas retroativas               ║
 ║                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════╝
     `);
     
+    logger.info('✅ Sistema V5.7 iniciado - Todas as correções aplicadas!');
+});
+    
     logger.info('✅ Sistema V5.6 iniciado - Data Customizada na Abertura!');
 });
+
 
