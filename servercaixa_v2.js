@@ -1,17 +1,15 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
- * SISTEMA DE CONTROLE DE CAIXA V5.5 - MELHORIAS + APIs POR UNIDADE
+ * SISTEMA DE CONTROLE DE CAIXA V5.6 - DATA CUSTOMIZADA NA ABERTURA
  * ═══════════════════════════════════════════════════════════════════════
  * 
- * ✅ NOVIDADES V5.5:
+ * ✅ NOVIDADES V5.6:
+ * • Abertura de caixa com data customizada (para registros antigos)
  * • API GET /api/lancamentos/unidade/:unidade - Lista todos lançamentos por unidade
  * • API GET /api/caixa/fechados - Lista caixas fechados com seus lançamentos
  * • API GET /api/caixa/unidade/:unidade - Lista caixas por unidade (abertos/fechados)
- * • Abertura de caixa agora exige campo "unidade"
- * • Importação usa data original dos lançamentos (não data atual)
- * • Opção de sobrescrever data na importação via parâmetro
- * • Validação melhorada de unidades
- * • Relatórios por unidade
+ * • Validação de data de abertura
+ * • Importação usa data original dos lançamentos
  */
 
 const express = require('express');
@@ -83,7 +81,8 @@ const schemas = {
     abrirCaixa: Joi.object({
         usuario: Joi.string().min(3).max(100).required(),
         unidade: Joi.string().min(2).max(100).required(),
-        saldo_inicial_informado: Joi.number().optional()
+        saldo_inicial_informado: Joi.number().optional(),
+        data_abertura: Joi.string().optional() // ✅ NOVO: permite data customizada
     }),
     
     registrarMovimento: Joi.object({
@@ -367,7 +366,7 @@ function detectarFormaPagamento(descricao) {
 // ═══════════════════════════════════════════════════════════════════════
 
 // ───────────────────────────────────────────────────────────────────────
-// 1. ABRIR CAIXA (COM VALIDAÇÃO DE UNIDADE)
+// 1. ✅ ABRIR CAIXA (AGORA COM DATA CUSTOMIZADA)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
@@ -380,7 +379,20 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
             });
         }
 
-        const { usuario, unidade, saldo_inicial_informado } = value;
+        const { usuario, unidade, saldo_inicial_informado, data_abertura } = value;
+
+        // ✅ Converter data de abertura (se fornecida) ou usar data atual
+        const dataAberturaFormatada = data_abertura 
+            ? converterData(data_abertura) 
+            : moment().format('YYYY-MM-DD HH:mm:ss');
+
+        // Validar se a data não é futura
+        if (moment(dataAberturaFormatada).isAfter(moment())) {
+            return res.status(400).json({ 
+                erro: true, 
+                mensagem: 'A data de abertura não pode ser no futuro' 
+            });
+        }
 
         // Verifica se já existe caixa aberto para esta unidade
         const caixaAbertoUnidade = await dbGet(
@@ -395,30 +407,47 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
             });
         }
 
-        const dataAbertura = moment().format('YYYY-MM-DD HH:mm:ss');
+        // ✅ Verifica se já existe caixa (aberto ou fechado) com a mesma data para a unidade
+        const caixaMesmaData = await dbGet(
+            'SELECT * FROM caixa_controle WHERE unidade = ? AND DATE(data_abertura) = DATE(?) LIMIT 1',
+            [unidade, dataAberturaFormatada]
+        );
+
+        if (caixaMesmaData) {
+            return res.status(400).json({ 
+                erro: true, 
+                mensagem: `Já existe um caixa para a unidade "${unidade}" na data ${moment(dataAberturaFormatada).format('DD/MM/YYYY')} (ID: ${caixaMesmaData.id})` 
+            });
+        }
+
         const saldoInicial = saldo_inicial_informado || 0;
 
         const result = await dbRun(
             `INSERT INTO caixa_controle (usuario_abertura, unidade, data_abertura, saldo_inicial, status) 
              VALUES (?, ?, ?, ?, 'ABERTO')`,
-            [usuario, unidade, dataAbertura, saldoInicial]
+            [usuario, unidade, dataAberturaFormatada, saldoInicial]
         );
 
         await registrarAuditoria(usuario, 'ABERTURA_CAIXA', { 
             id_caixa: result.id, 
             unidade, 
-            saldo_inicial: saldoInicial 
+            saldo_inicial: saldoInicial,
+            data_abertura: dataAberturaFormatada,
+            data_customizada: !!data_abertura
         }, req.ip);
 
         res.json({
             sucesso: true,
-            mensagem: `Caixa aberto com sucesso para a unidade "${unidade}"!`,
+            mensagem: data_abertura 
+                ? `Caixa aberto com sucesso para a unidade "${unidade}" na data ${moment(dataAberturaFormatada).format('DD/MM/YYYY HH:mm')}!`
+                : `Caixa aberto com sucesso para a unidade "${unidade}"!`,
             dados: {
                 id_caixa: result.id,
                 usuario_abertura: usuario,
                 unidade: unidade,
-                data_abertura: dataAbertura,
-                saldo_inicial: parseFloat(saldoInicial.toFixed(2))
+                data_abertura: dataAberturaFormatada,
+                saldo_inicial: parseFloat(saldoInicial.toFixed(2)),
+                data_customizada: !!data_abertura
             }
         });
 
@@ -571,7 +600,7 @@ app.get('/api/caixa/status', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 4. ✅ NOVA: LISTAR CAIXAS POR UNIDADE
+// 4. LISTAR CAIXAS POR UNIDADE
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/caixa/unidade/:unidade', authMiddleware, async (req, res) => {
@@ -651,7 +680,7 @@ app.get('/api/caixa/unidade/:unidade', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 5. ✅ NOVA: LISTAR TODOS OS CAIXAS FECHADOS COM LANÇAMENTOS
+// 5. LISTAR TODOS OS CAIXAS FECHADOS COM LANÇAMENTOS
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/caixa/fechados', authMiddleware, async (req, res) => {
@@ -741,7 +770,7 @@ app.get('/api/caixa/fechados', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 6. ✅ NOVA: LISTAR TODOS OS LANÇAMENTOS POR UNIDADE
+// 6. LISTAR TODOS OS LANÇAMENTOS POR UNIDADE
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/lancamentos/unidade/:unidade', authMiddleware, async (req, res) => {
@@ -1073,7 +1102,7 @@ app.delete('/api/movimento/:id', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 11. ✅ IMPORTAR EXCEL (CORRIGIDO - USA DATA ORIGINAL)
+// 11. IMPORTAR EXCEL (USA DATA ORIGINAL)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'), async (req, res) => {
@@ -1175,7 +1204,7 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     linha['Pagamento'] !== undefined && linha['Pagamento'] !== '' ? linha['Pagamento'] :
                     linha['TotalPago'] !== undefined && linha['TotalPago'] !== '' ? linha['TotalPago'] : 0;
 
-                // ✅ USA DATA ORIGINAL DO LANÇAMENTO, NÃO DATA ATUAL
+                // USA DATA ORIGINAL DO LANÇAMENTO, NÃO DATA ATUAL
                 let dataCadastro;
                 if (!usar_data_original && data_lancamento) {
                     // Se usuário quer sobrescrever a data
@@ -1239,7 +1268,7 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     [
                         caixaAberto.id,
                         requisicao,
-                        dataCadastro,  // ✅ USA DATA ORIGINAL DO LANÇAMENTO
+                        dataCadastro,
                         usuario,
                         valor,
                         tipoTransacao,
@@ -1594,7 +1623,7 @@ app.use((req, res) => {
         erro: true,
         mensagem: `Rota não encontrada: ${req.method} ${req.path}`,
         rotas_disponiveis: [
-            'POST /api/caixa/abrir',
+            'POST /api/caixa/abrir (✅ AGORA COM data_abertura OPCIONAL)',
             'POST /api/caixa/fechar',
             'GET /api/caixa/status',
             'GET /api/caixa/unidade/:unidade',
@@ -1673,7 +1702,7 @@ app.listen(PORT, () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                                                                       ║
-║   🚀 SISTEMA DE CONTROLE DE CAIXA V5.5 - APIs POR UNIDADE           ║
+║   🚀 SISTEMA DE CONTROLE DE CAIXA V5.6 - DATA CUSTOMIZADA           ║
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
@@ -1684,17 +1713,17 @@ app.listen(PORT, () => {
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
-║   ✅ NOVIDADES V5.5:                                                 ║
+║   ✅ NOVIDADES V5.6:                                                 ║
+║   • Abertura de caixa com DATA CUSTOMIZADA                           ║
+║   • Validação de data não futura                                     ║
+║   • Prevenção de caixas duplicados na mesma data                     ║
 ║   • GET /api/lancamentos/unidade/:unidade                            ║
-║   • GET /api/caixa/fechados (com lançamentos)                        ║
+║   • GET /api/caixa/fechados                                          ║
 ║   • GET /api/caixa/unidade/:unidade                                  ║
-║   • Abertura de caixa exige unidade                                  ║
-║   • Importação usa data ORIGINAL dos lançamentos                     ║
-║   • Controle de duplicatas melhorado                                 ║
 ║                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════╝
     `);
     
-    logger.info('✅ Sistema V5.5 iniciado - APIs por Unidade!');
+    logger.info('✅ Sistema V5.6 iniciado - Data Customizada na Abertura!');
 });
 
