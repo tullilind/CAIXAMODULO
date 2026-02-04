@@ -1,15 +1,17 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
- * SISTEMA DE CONTROLE DE CAIXA V5.4 - DATAS + ANTI-DUPLICATA + CLEANUP
+ * SISTEMA DE CONTROLE DE CAIXA V5.5 - MELHORIAS + APIs POR UNIDADE
  * ═══════════════════════════════════════════════════════════════════════
  * 
- * ✅ CORREÇÕES V5.4:
- * • Datas DD/MM/YYYY HH:mm:ss do Excel convertidas corretamente
- * • Migration: coluna 'detalhes' adicionada à auditoria se não existir
- * • Anti-duplicata na importação (Requisicao + valor + data)
- * • Endpoint POST /api/cleanup para remover duplicatas existentes
- * • Linhas com valor 0 ignoradas na importação
- * • Headers mapeados com nomes reais do Excel
+ * ✅ NOVIDADES V5.5:
+ * • API GET /api/lancamentos/unidade/:unidade - Lista todos lançamentos por unidade
+ * • API GET /api/caixa/fechados - Lista caixas fechados com seus lançamentos
+ * • API GET /api/caixa/unidade/:unidade - Lista caixas por unidade (abertos/fechados)
+ * • Abertura de caixa agora exige campo "unidade"
+ * • Importação usa data original dos lançamentos (não data atual)
+ * • Opção de sobrescrever data na importação via parâmetro
+ * • Validação melhorada de unidades
+ * • Relatórios por unidade
  */
 
 const express = require('express');
@@ -80,7 +82,7 @@ const logger = winston.createLogger({
 const schemas = {
     abrirCaixa: Joi.object({
         usuario: Joi.string().min(3).max(100).required(),
-        unidade: Joi.string().min(3).max(100).required(),
+        unidade: Joi.string().min(2).max(100).required(),
         saldo_inicial_informado: Joi.number().optional()
     }),
     
@@ -104,6 +106,12 @@ const schemas = {
         descricao_transacao: Joi.string().allow('').optional(),
         posto_coleta: Joi.string().allow('').optional(),
         motivo_edicao: Joi.string().required()
+    }),
+
+    importarDados: Joi.object({
+        usuario: Joi.string().optional(),
+        usar_data_original: Joi.boolean().default(true),
+        data_lancamento: Joi.string().optional()
     })
 };
 
@@ -142,33 +150,24 @@ const upload = multer({
 // MIDDLEWARE - ORDEM IMPORTANTE!
 // ═══════════════════════════════════════════════════════════════════════
 
-// 1. Helmet (segurança)
 app.use(helmet({ contentSecurityPolicy: false }));
-
-// 2. Compression
 app.use(compression());
-
-// 3. CORS
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'x-api-key']
 }));
 
-// 4. Body parsers
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// 5. ✅ GARANTIR QUE TODAS AS RESPOSTAS SEJAM JSON
 app.use((req, res, next) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     next();
 });
 
-// 6. Arquivos estáticos
 app.use(express.static(path.join(__dirname, 'public')));
 
-// 7. Rate limiters
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
@@ -182,7 +181,6 @@ const uploadLimiter = rateLimit({
     message: { erro: true, mensagem: 'Limite de importações atingido.' }
 });
 
-// 8. Autenticação
 const authMiddleware = (req, res, next) => {
     const token = req.headers['x-api-key'];
     if (!token || token !== API_KEY) {
@@ -195,7 +193,6 @@ const authMiddleware = (req, res, next) => {
     next();
 };
 
-// 9. Logging de requisições
 app.use((req, res, next) => {
     const start = Date.now();
     res.on('finish', () => {
@@ -267,19 +264,13 @@ function inicializarTabelas() {
             )
         `);
 
-        // ── MIGRATION V5.4: adiciona coluna 'detalhes' na auditoria se não existir ──
-        db.run(`PRAGMA table_info(auditoria)`, (err, cols) => {
-            if (err) { logger.error('Erro PRAGMA auditoria:', err); return; }
-            const nomes = (cols || []).map(c => c.name);
-            if (!nomes.includes('detalhes')) {
-                db.run(`ALTER TABLE auditoria ADD COLUMN detalhes TEXT`, (err2) => {
-                    if (err2) logger.error('Erro ALTER auditoria:', err2);
-                    else      logger.info('✅ Migration V5.4: coluna "detalhes" adicionada.');
-                });
-            }
-        });
+        // Criar índices para melhor performance
+        db.run(`CREATE INDEX IF NOT EXISTS idx_movimentos_caixa ON movimentos(id_caixa)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_movimentos_data ON movimentos(data_cadastro)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_caixa_unidade ON caixa_controle(unidade)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_caixa_status ON caixa_controle(status)`);
 
-        logger.info('✅ Tabelas verificadas/criadas com sucesso.');
+        logger.info('✅ Tabelas e índices verificados/criados com sucesso.');
     });
 }
 
@@ -325,7 +316,6 @@ async function registrarAuditoria(usuario, acao, detalhes, ip) {
     }
 }
 
-// ✅ FUNÇÃO PARA CALCULAR SALDO CORRETO
 function calcularSaldo(saldoInicial, totalCredito, totalDebito) {
     const inicial = parseFloat(saldoInicial) || 0;
     const credito = parseFloat(totalCredito) || 0;
@@ -333,36 +323,30 @@ function calcularSaldo(saldoInicial, totalCredito, totalDebito) {
     return inicial + credito - debito;
 }
 
-// ✅ FUNÇÃO PARA CONVERTER DATA do Excel (DD/MM/YYYY HH:mm:ss → YYYY-MM-DD HH:mm:ss)
 function converterData(valorData) {
     if (!valorData) return moment().format('YYYY-MM-DD HH:mm:ss');
 
     const str = String(valorData).trim();
 
-    // Se já está no formato ISO (YYYY-MM-DD ...), usa direto
     if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
         const m = moment(str, 'YYYY-MM-DD HH:mm:ss', true);
         return m.isValid() ? m.format('YYYY-MM-DD HH:mm:ss') : moment().format('YYYY-MM-DD HH:mm:ss');
     }
 
-    // Formato brasileiro: DD/MM/YYYY HH:mm:ss
     if (/^\d{2}\/\d{2}\/\d{4}/.test(str)) {
         const m = moment(str, 'DD/MM/YYYY HH:mm:ss', true);
         return m.isValid() ? m.format('YYYY-MM-DD HH:mm:ss') : moment().format('YYYY-MM-DD HH:mm:ss');
     }
 
-    // Formato brasileiro sem hora: DD/MM/YYYY
     if (/^\d{2}\/\d{2}\/\d{4}$/.test(str)) {
         const m = moment(str, 'DD/MM/YYYY', true);
         return m.isValid() ? m.format('YYYY-MM-DD HH:mm:ss') : moment().format('YYYY-MM-DD HH:mm:ss');
     }
 
-    // Tentativa genérica com moment
     const m = moment(str);
     return m.isValid() ? m.format('YYYY-MM-DD HH:mm:ss') : moment().format('YYYY-MM-DD HH:mm:ss');
 }
 
-// ✅ FUNÇÃO PARA DETECTAR FORMA DE PAGAMENTO PELA DESCRIÇÃO
 function detectarFormaPagamento(descricao) {
     if (!descricao) return 'OUTRO';
     
@@ -383,7 +367,7 @@ function detectarFormaPagamento(descricao) {
 // ═══════════════════════════════════════════════════════════════════════
 
 // ───────────────────────────────────────────────────────────────────────
-// 1. ABRIR CAIXA
+// 1. ABRIR CAIXA (COM VALIDAÇÃO DE UNIDADE)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
@@ -398,14 +382,16 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
 
         const { usuario, unidade, saldo_inicial_informado } = value;
 
-        const caixaAberto = await dbGet(
-            'SELECT * FROM caixa_controle WHERE status = "ABERTO" ORDER BY data_abertura DESC LIMIT 1'
+        // Verifica se já existe caixa aberto para esta unidade
+        const caixaAbertoUnidade = await dbGet(
+            'SELECT * FROM caixa_controle WHERE status = "ABERTO" AND unidade = ? ORDER BY data_abertura DESC LIMIT 1',
+            [unidade]
         );
 
-        if (caixaAberto) {
+        if (caixaAbertoUnidade) {
             return res.status(400).json({ 
                 erro: true, 
-                mensagem: `Já existe um caixa aberto (ID: ${caixaAberto.id}) desde ${caixaAberto.data_abertura}` 
+                mensagem: `Já existe um caixa aberto para a unidade "${unidade}" (ID: ${caixaAbertoUnidade.id}) desde ${caixaAbertoUnidade.data_abertura}` 
             });
         }
 
@@ -426,7 +412,7 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
 
         res.json({
             sucesso: true,
-            mensagem: 'Caixa aberto com sucesso!',
+            mensagem: `Caixa aberto com sucesso para a unidade "${unidade}"!`,
             dados: {
                 id_caixa: result.id,
                 usuario_abertura: usuario,
@@ -448,7 +434,8 @@ app.post('/api/caixa/abrir', authMiddleware, async (req, res) => {
 
 app.post('/api/caixa/fechar', authMiddleware, async (req, res) => {
     try {
-        const { usuario } = req.body;
+        const { usuario, unidade } = req.body;
+        
         if (!usuario) {
             return res.status(400).json({ 
                 erro: true, 
@@ -456,14 +443,24 @@ app.post('/api/caixa/fechar', authMiddleware, async (req, res) => {
             });
         }
 
-        const caixaAberto = await dbGet(
-            'SELECT * FROM caixa_controle WHERE status = "ABERTO" ORDER BY data_abertura DESC LIMIT 1'
-        );
+        let query = 'SELECT * FROM caixa_controle WHERE status = "ABERTO"';
+        let params = [];
+
+        if (unidade) {
+            query += ' AND unidade = ?';
+            params.push(unidade);
+        }
+
+        query += ' ORDER BY data_abertura DESC LIMIT 1';
+
+        const caixaAberto = await dbGet(query, params);
 
         if (!caixaAberto) {
             return res.status(400).json({ 
                 erro: true, 
-                mensagem: 'Nenhum caixa aberto para fechar' 
+                mensagem: unidade 
+                    ? `Nenhum caixa aberto para a unidade "${unidade}"` 
+                    : 'Nenhum caixa aberto para fechar'
             });
         }
 
@@ -485,14 +482,16 @@ app.post('/api/caixa/fechar', authMiddleware, async (req, res) => {
 
         await registrarAuditoria(usuario, 'FECHAMENTO_CAIXA', { 
             id_caixa: caixaAberto.id, 
+            unidade: caixaAberto.unidade,
             saldo_final: saldoFinal 
         }, req.ip);
 
         res.json({
             sucesso: true,
-            mensagem: 'Caixa fechado com sucesso!',
+            mensagem: `Caixa fechado com sucesso para a unidade "${caixaAberto.unidade}"!`,
             dados: {
                 id_caixa: caixaAberto.id,
+                unidade: caixaAberto.unidade,
                 usuario_fechamento: usuario,
                 data_fechamento: dataFechamento,
                 saldo_inicial: parseFloat(caixaAberto.saldo_inicial.toFixed(2)),
@@ -514,15 +513,27 @@ app.post('/api/caixa/fechar', authMiddleware, async (req, res) => {
 
 app.get('/api/caixa/status', authMiddleware, async (req, res) => {
     try {
-        const caixaAberto = await dbGet(
-            'SELECT * FROM caixa_controle WHERE status = "ABERTO" ORDER BY data_abertura DESC LIMIT 1'
-        );
+        const { unidade } = req.query;
+
+        let query = 'SELECT * FROM caixa_controle WHERE status = "ABERTO"';
+        let params = [];
+
+        if (unidade) {
+            query += ' AND unidade = ?';
+            params.push(unidade);
+        }
+
+        query += ' ORDER BY data_abertura DESC LIMIT 1';
+
+        const caixaAberto = await dbGet(query, params);
 
         if (!caixaAberto) {
             return res.json({
                 sucesso: true,
                 caixa_aberto: false,
-                mensagem: 'Nenhum caixa aberto no momento'
+                mensagem: unidade 
+                    ? `Nenhum caixa aberto para a unidade "${unidade}"` 
+                    : 'Nenhum caixa aberto no momento'
             });
         }
 
@@ -560,7 +571,271 @@ app.get('/api/caixa/status', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 4. REGISTRAR MOVIMENTO
+// 4. ✅ NOVA: LISTAR CAIXAS POR UNIDADE
+// ───────────────────────────────────────────────────────────────────────
+
+app.get('/api/caixa/unidade/:unidade', authMiddleware, async (req, res) => {
+    try {
+        const { unidade } = req.params;
+        const { status, data_inicio, data_fim } = req.query;
+
+        let query = 'SELECT * FROM caixa_controle WHERE unidade = ?';
+        let params = [unidade];
+
+        if (status) {
+            query += ' AND status = ?';
+            params.push(status.toUpperCase());
+        }
+
+        if (data_inicio) {
+            query += ' AND DATE(data_abertura) >= ?';
+            params.push(data_inicio);
+        }
+
+        if (data_fim) {
+            query += ' AND DATE(data_abertura) <= ?';
+            params.push(data_fim);
+        }
+
+        query += ' ORDER BY data_abertura DESC';
+
+        const caixas = await dbAll(query, params);
+
+        if (caixas.length === 0) {
+            return res.json({
+                sucesso: true,
+                mensagem: `Nenhum caixa encontrado para a unidade "${unidade}"`,
+                dados: []
+            });
+        }
+
+        // Enriquecer com dados de movimentos
+        const caixasCompletos = await Promise.all(caixas.map(async (caixa) => {
+            const movimentos = await dbGet(
+                `SELECT 
+                    SUM(CASE WHEN tipo_transacao = 'CREDITO' THEN valor ELSE 0 END) as total_credito,
+                    SUM(CASE WHEN tipo_transacao = 'DEBITO' THEN valor ELSE 0 END) as total_debito,
+                    COUNT(*) as quantidade
+                 FROM movimentos WHERE id_caixa = ?`,
+                [caixa.id]
+            );
+
+            const saldoCalculado = calcularSaldo(caixa.saldo_inicial, movimentos.total_credito, movimentos.total_debito);
+
+            return {
+                id: caixa.id,
+                status: caixa.status,
+                usuario_abertura: caixa.usuario_abertura,
+                unidade: caixa.unidade,
+                data_abertura: caixa.data_abertura,
+                data_fechamento: caixa.data_fechamento,
+                saldo_inicial: parseFloat(caixa.saldo_inicial.toFixed(2)),
+                saldo_final: parseFloat((caixa.saldo_final || saldoCalculado).toFixed(2)),
+                movimentacoes_credito: parseFloat((movimentos.total_credito || 0).toFixed(2)),
+                movimentacoes_debito: parseFloat((movimentos.total_debito || 0).toFixed(2)),
+                quantidade_lancamentos: movimentos.quantidade || 0
+            };
+        }));
+
+        res.json({
+            sucesso: true,
+            unidade: unidade,
+            total_caixas: caixasCompletos.length,
+            dados: caixasCompletos
+        });
+
+    } catch (error) {
+        logger.error('Erro ao listar caixas por unidade:', error);
+        res.status(500).json({ erro: true, mensagem: error.message });
+    }
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// 5. ✅ NOVA: LISTAR TODOS OS CAIXAS FECHADOS COM LANÇAMENTOS
+// ───────────────────────────────────────────────────────────────────────
+
+app.get('/api/caixa/fechados', authMiddleware, async (req, res) => {
+    try {
+        const { unidade, data_inicio, data_fim, incluir_lancamentos = 'true' } = req.query;
+
+        let query = 'SELECT * FROM caixa_controle WHERE status = "FECHADO"';
+        let params = [];
+
+        if (unidade) {
+            query += ' AND unidade = ?';
+            params.push(unidade);
+        }
+
+        if (data_inicio) {
+            query += ' AND DATE(data_fechamento) >= ?';
+            params.push(data_inicio);
+        }
+
+        if (data_fim) {
+            query += ' AND DATE(data_fechamento) <= ?';
+            params.push(data_fim);
+        }
+
+        query += ' ORDER BY data_fechamento DESC';
+
+        const caixas = await dbAll(query, params);
+
+        if (caixas.length === 0) {
+            return res.json({
+                sucesso: true,
+                mensagem: 'Nenhum caixa fechado encontrado',
+                dados: []
+            });
+        }
+
+        const caixasCompletos = await Promise.all(caixas.map(async (caixa) => {
+            const resumo = await dbGet(
+                `SELECT 
+                    SUM(CASE WHEN tipo_transacao = 'CREDITO' THEN valor ELSE 0 END) as total_credito,
+                    SUM(CASE WHEN tipo_transacao = 'DEBITO' THEN valor ELSE 0 END) as total_debito,
+                    COUNT(*) as quantidade
+                 FROM movimentos WHERE id_caixa = ?`,
+                [caixa.id]
+            );
+
+            let lancamentos = [];
+            if (incluir_lancamentos === 'true') {
+                lancamentos = await dbAll(
+                    'SELECT * FROM movimentos WHERE id_caixa = ? ORDER BY data_cadastro DESC',
+                    [caixa.id]
+                );
+            }
+
+            return {
+                id: caixa.id,
+                unidade: caixa.unidade,
+                usuario_abertura: caixa.usuario_abertura,
+                data_abertura: caixa.data_abertura,
+                data_fechamento: caixa.data_fechamento,
+                saldo_inicial: parseFloat(caixa.saldo_inicial.toFixed(2)),
+                saldo_final: parseFloat((caixa.saldo_final || 0).toFixed(2)),
+                resumo: {
+                    total_credito: parseFloat((resumo.total_credito || 0).toFixed(2)),
+                    total_debito: parseFloat((resumo.total_debito || 0).toFixed(2)),
+                    quantidade_lancamentos: resumo.quantidade || 0
+                },
+                lancamentos: incluir_lancamentos === 'true' ? lancamentos : undefined
+            };
+        }));
+
+        res.json({
+            sucesso: true,
+            total_caixas_fechados: caixasCompletos.length,
+            filtros: {
+                unidade: unidade || 'Todas',
+                data_inicio: data_inicio || 'Todas',
+                data_fim: data_fim || 'Todas'
+            },
+            dados: caixasCompletos
+        });
+
+    } catch (error) {
+        logger.error('Erro ao listar caixas fechados:', error);
+        res.status(500).json({ erro: true, mensagem: error.message });
+    }
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// 6. ✅ NOVA: LISTAR TODOS OS LANÇAMENTOS POR UNIDADE
+// ───────────────────────────────────────────────────────────────────────
+
+app.get('/api/lancamentos/unidade/:unidade', authMiddleware, async (req, res) => {
+    try {
+        const { unidade } = req.params;
+        const { data_inicio, data_fim, tipo, pagina = 1, limite = 100 } = req.query;
+        const offset = (pagina - 1) * limite;
+
+        // Buscar IDs dos caixas desta unidade
+        const caixas = await dbAll(
+            'SELECT id FROM caixa_controle WHERE unidade = ?',
+            [unidade]
+        );
+
+        if (caixas.length === 0) {
+            return res.json({
+                sucesso: true,
+                mensagem: `Nenhum caixa encontrado para a unidade "${unidade}"`,
+                dados: [],
+                resumo: {
+                    total_credito: 0,
+                    total_debito: 0,
+                    saldo: 0,
+                    quantidade: 0
+                }
+            });
+        }
+
+        const idsCaixas = caixas.map(c => c.id);
+        const placeholders = idsCaixas.map(() => '?').join(',');
+
+        let query = `SELECT m.*, c.unidade 
+                     FROM movimentos m 
+                     INNER JOIN caixa_controle c ON m.id_caixa = c.id 
+                     WHERE m.id_caixa IN (${placeholders})`;
+        let params = [...idsCaixas];
+
+        if (data_inicio) {
+            query += ' AND DATE(m.data_cadastro) >= ?';
+            params.push(data_inicio);
+        }
+        if (data_fim) {
+            query += ' AND DATE(m.data_cadastro) <= ?';
+            params.push(data_fim);
+        }
+        if (tipo) {
+            query += ' AND m.tipo_transacao = ?';
+            params.push(tipo);
+        }
+
+        // Calcular totais
+        const resumo = await dbGet(
+            `SELECT 
+                SUM(CASE WHEN tipo_transacao = 'CREDITO' THEN valor ELSE 0 END) as total_credito,
+                SUM(CASE WHEN tipo_transacao = 'DEBITO' THEN valor ELSE 0 END) as total_debito,
+                COUNT(*) as quantidade
+             FROM movimentos WHERE id_caixa IN (${placeholders})`,
+            idsCaixas
+        );
+
+        const total = await dbGet(`SELECT COUNT(*) as total FROM (${query})`, params);
+
+        query += ' ORDER BY m.data_cadastro DESC LIMIT ? OFFSET ?';
+        params.push(parseInt(limite), offset);
+
+        const lancamentos = await dbAll(query, params);
+
+        const saldo = (resumo.total_credito || 0) - (resumo.total_debito || 0);
+
+        res.json({
+            sucesso: true,
+            unidade: unidade,
+            dados: lancamentos,
+            resumo: {
+                total_credito: parseFloat((resumo.total_credito || 0).toFixed(2)),
+                total_debito: parseFloat((resumo.total_debito || 0).toFixed(2)),
+                saldo: parseFloat(saldo.toFixed(2)),
+                quantidade: resumo.quantidade || 0
+            },
+            paginacao: {
+                total: total.total,
+                pagina_atual: parseInt(pagina),
+                total_paginas: Math.ceil(total.total / limite)
+            }
+        });
+
+    } catch (error) {
+        logger.error('Erro ao listar lançamentos por unidade:', error);
+        res.status(500).json({ erro: true, mensagem: error.message });
+    }
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// 7. REGISTRAR MOVIMENTO
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/movimento', authMiddleware, async (req, res) => {
@@ -573,14 +848,26 @@ app.post('/api/movimento', authMiddleware, async (req, res) => {
             });
         }
 
-        const caixaAberto = await dbGet(
-            'SELECT id FROM caixa_controle WHERE status = "ABERTO" ORDER BY data_abertura DESC LIMIT 1'
-        );
+        const { unidade } = req.body;
+
+        let query = 'SELECT id FROM caixa_controle WHERE status = "ABERTO"';
+        let params = [];
+
+        if (unidade) {
+            query += ' AND unidade = ?';
+            params.push(unidade);
+        }
+
+        query += ' ORDER BY data_abertura DESC LIMIT 1';
+
+        const caixaAberto = await dbGet(query, params);
 
         if (!caixaAberto) {
             return res.status(400).json({ 
                 erro: true, 
-                mensagem: 'Nenhum caixa aberto. Abra um caixa antes de registrar movimentos.' 
+                mensagem: unidade 
+                    ? `Nenhum caixa aberto para a unidade "${unidade}". Abra um caixa antes de registrar movimentos.`
+                    : 'Nenhum caixa aberto. Abra um caixa antes de registrar movimentos.' 
             });
         }
 
@@ -625,7 +912,7 @@ app.post('/api/movimento', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 5. LISTAR MOVIMENTOS
+// 8. LISTAR MOVIMENTOS
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/movimentos', authMiddleware, async (req, res) => {
@@ -673,7 +960,7 @@ app.get('/api/movimentos', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 6. EDITAR MOVIMENTO
+// 9. EDITAR MOVIMENTO
 // ───────────────────────────────────────────────────────────────────────
 
 app.put('/api/movimento/:id', authMiddleware, async (req, res) => {
@@ -743,7 +1030,7 @@ app.put('/api/movimento/:id', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 7. DELETAR MOVIMENTO
+// 10. DELETAR MOVIMENTO
 // ───────────────────────────────────────────────────────────────────────
 
 app.delete('/api/movimento/:id', authMiddleware, async (req, res) => {
@@ -786,7 +1073,7 @@ app.delete('/api/movimento/:id', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 8. ✅ IMPORTAR EXCEL (CORRIGIDO)
+// 11. ✅ IMPORTAR EXCEL (CORRIGIDO - USA DATA ORIGINAL)
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'), async (req, res) => {
@@ -794,7 +1081,6 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
     let erros = [];
 
     try {
-        // ✅ VERIFICAÇÃO 1: Arquivo enviado
         if (!req.file) {
             logger.error('Nenhum arquivo foi enviado na requisição');
             return res.status(400).json({ 
@@ -805,21 +1091,42 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
 
         logger.info(`Arquivo recebido: ${req.file.originalname} (${req.file.size} bytes)`);
 
-        // ✅ VERIFICAÇÃO 2: Caixa aberto
-        const caixaAberto = await dbGet(
-            'SELECT id FROM caixa_controle WHERE status = "ABERTO" ORDER BY data_abertura DESC LIMIT 1'
-        );
+        // Validar parâmetros de importação
+        const { error, value } = schemas.importarDados.validate(req.body);
+        if (error) {
+            if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+            return res.status(400).json({ 
+                erro: true, 
+                mensagem: `Dados inválidos: ${error.details[0].message}` 
+            });
+        }
+
+        const { usar_data_original = true, data_lancamento, unidade } = value;
+
+        // Verificar caixa aberto
+        let query = 'SELECT id, unidade FROM caixa_controle WHERE status = "ABERTO"';
+        let params = [];
+
+        if (unidade) {
+            query += ' AND unidade = ?';
+            params.push(unidade);
+        }
+
+        query += ' ORDER BY data_abertura DESC LIMIT 1';
+
+        const caixaAberto = await dbGet(query, params);
 
         if (!caixaAberto) {
             if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
             logger.error('Tentativa de importação sem caixa aberto');
             return res.status(400).json({ 
                 erro: true, 
-                mensagem: 'Nenhum caixa aberto. Abra um caixa antes de importar dados.' 
+                mensagem: unidade 
+                    ? `Nenhum caixa aberto para a unidade "${unidade}". Abra um caixa antes de importar dados.`
+                    : 'Nenhum caixa aberto. Abra um caixa antes de importar dados.'
             });
         }
 
-        // ✅ VERIFICAÇÃO 3: Leitura do arquivo Excel
         let workbook;
         try {
             workbook = xlsx.readFile(req.file.path);
@@ -847,49 +1154,45 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
             });
         }
 
-        // ── log de debug: headers reais do Excel ──
         if (dados.length > 0) {
             logger.info('Headers detectados: ' + JSON.stringify(Object.keys(dados[0])));
         }
 
         let duplicatas = 0;
 
-        // ✅ VERIFICAÇÃO 4: Processar cada linha
         for (let i = 0; i < dados.length; i++) {
             const linha = dados[i];
             const numeroLinha = i + 2;
 
             try {
-                // ─── MAPEAMENTO (headers reais confirmados nos logs) ───
-                // Requisicao | DataCadastro | Usuario | DataTransacao |
-                // Pagamento | TotalPedido | Descontos | TotalPago | Saldo |
-                // Nome | Sobrenome | DescricaoTransacao | TipoMovimento |
-                // CPF | Convenio | Departamento | PostoColeta | Setor | MessagenAdministrativa
-
                 const requisicao  = String(linha['Requisicao']  || '').trim();
                 const descricao   = String(linha['DescricaoTransacao'] || '').trim();
                 const usuario     = String(linha['Usuario']     || 'Sistema').trim();
                 const posto       = String(linha['PostoColeta'] || '').trim();
                 const nomeCompleto = [linha['Nome'] || '', linha['Sobrenome'] || ''].join(' ').trim();
 
-                // ── Valor: Pagamento primeiro, fallback TotalPago ──
                 const valorRaw =
                     linha['Pagamento'] !== undefined && linha['Pagamento'] !== '' ? linha['Pagamento'] :
                     linha['TotalPago'] !== undefined && linha['TotalPago'] !== '' ? linha['TotalPago'] : 0;
 
-                // ── Data: DataTransacao convertida, fallback DataCadastro ──
-                const dataCadastro = converterData(linha['DataTransacao'] || linha['DataCadastro']);
+                // ✅ USA DATA ORIGINAL DO LANÇAMENTO, NÃO DATA ATUAL
+                let dataCadastro;
+                if (!usar_data_original && data_lancamento) {
+                    // Se usuário quer sobrescrever a data
+                    dataCadastro = converterData(data_lancamento);
+                } else {
+                    // Usa data original do Excel
+                    dataCadastro = converterData(linha['DataTransacao'] || linha['DataCadastro']);
+                }
 
-                // ── Valor numérico ──
                 let valor = parseFloat(String(valorRaw).replace(/[^\d.,-]/g, '').replace(',', '.'));
 
-                // Valor 0 ou NaN → ignora
                 if (isNaN(valor) || valor === 0) {
                     logger.warn(`Linha ${numeroLinha}: valor zerado/inválido "${valorRaw}" — ignorada`);
                     continue;
                 }
 
-                // ── ANTI-DUPLICATA: se Requisicao existe, verifica no banco ──
+                // Anti-duplicata
                 if (requisicao !== '') {
                     const existe = await dbGet(
                         `SELECT id FROM movimentos
@@ -904,7 +1207,6 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     }
                 }
 
-                // ── TIPO DE TRANSAÇÃO: sinal → TipoMovimento → descrição ──
                 let tipoTransacao = 'CREDITO';
                 if (valor < 0) {
                     tipoTransacao = 'DEBITO';
@@ -923,16 +1225,13 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     }
                 }
 
-                // ── FORMA DE PAGAMENTO ──
                 const formaPagamento = detectarFormaPagamento(descricao);
 
-                // ── DESCRIÇÃO FINAL (nome do cliente + descrição) ──
                 let descricaoFinal = descricao;
                 if (nomeCompleto && !descricao.toUpperCase().includes(nomeCompleto.toUpperCase())) {
                     descricaoFinal = nomeCompleto + (descricao ? ' - ' + descricao : '');
                 }
 
-                // ── INSERIR ──
                 await dbRun(
                     `INSERT INTO movimentos 
                      (id_caixa, requisicao, data_cadastro, usuario, valor, tipo_transacao, forma_pagamento, descricao_transacao, posto_coleta) 
@@ -940,7 +1239,7 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                     [
                         caixaAberto.id,
                         requisicao,
-                        dataCadastro,
+                        dataCadastro,  // ✅ USA DATA ORIGINAL DO LANÇAMENTO
                         usuario,
                         valor,
                         tipoTransacao,
@@ -951,7 +1250,7 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
                 );
 
                 importados++;
-                logger.info(`Linha ${numeroLinha} importada: valor=${valor} tipo=${tipoTransacao} forma=${formaPagamento} data=${dataCadastro}`);
+                logger.info(`Linha ${numeroLinha} importada: valor=${valor} tipo=${tipoTransacao} data=${dataCadastro}`);
 
             } catch (erroLinha) {
                 logger.error(`Erro na linha ${numeroLinha}:`, erroLinha);
@@ -959,26 +1258,28 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
             }
         }
 
-        // Limpar arquivo
         if (fs.existsSync(req.file.path)) {
             fs.unlinkSync(req.file.path);
         }
 
-        // ✅ RESPOSTA FINAL
         await registrarAuditoria(req.body.usuario || 'Sistema', 'IMPORTACAO_EXCEL', {
             arquivo: req.file.originalname,
             importados: importados,
+            unidade: caixaAberto.unidade,
+            usar_data_original: usar_data_original,
             erros: erros.length
         }, req.ip);
 
         res.json({
             sucesso: true,
-            mensagem: `Importação concluída! ${importados} importado(s).${duplicatas > 0 ? ' ' + duplicatas + ' duplicata(s) ignorada(s).' : ''}`,
+            mensagem: `Importação concluída! ${importados} lançamento(s) importado(s) para a unidade "${caixaAberto.unidade}".${duplicatas > 0 ? ' ' + duplicatas + ' duplicata(s) ignorada(s).' : ''}`,
             dados: {
+                unidade: caixaAberto.unidade,
                 importados: importados,
                 duplicatas_ignoradas: duplicatas,
                 erros: erros.length,
-                detalhes_erros: erros.slice(0, 10)
+                detalhes_erros: erros.slice(0, 10),
+                modo_data: usar_data_original ? 'Data original dos lançamentos' : 'Data customizada'
             }
         });
 
@@ -1002,7 +1303,7 @@ app.post('/api/importar', authMiddleware, uploadLimiter, upload.single('arquivo'
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 8b. CLEANUP — remover duplicatas existentes no banco
+// 12. CLEANUP
 // ───────────────────────────────────────────────────────────────────────
 
 app.post('/api/cleanup', authMiddleware, async (req, res) => {
@@ -1016,8 +1317,6 @@ app.post('/api/cleanup', authMiddleware, async (req, res) => {
             });
         }
 
-        // Encontra IDs duplicados: agrupa por (id_caixa, requisicao, valor, data_cadastro, tipo_transacao)
-        // e mantém apenas o menor ID de cada grupo (o primeiro inserido)
         const duplicatas = await dbAll(
             `SELECT id FROM movimentos
              WHERE id NOT IN (
@@ -1032,7 +1331,6 @@ app.post('/api/cleanup', authMiddleware, async (req, res) => {
             return res.json({ sucesso: true, mensagem: 'Nenhuma duplicata encontrada.', removidos: 0 });
         }
 
-        // Remove uma por uma dentro de uma transação
         const placeholders = idsParaRemover.map(() => '?').join(',');
         await dbRun(`DELETE FROM movimentos WHERE id IN (${placeholders})`, idsParaRemover);
 
@@ -1059,7 +1357,7 @@ app.post('/api/cleanup', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 9. BACKUP
+// 13. BACKUP
 // ───────────────────────────────────────────────────────────────────────
 
 async function realizarBackup() {
@@ -1102,7 +1400,7 @@ app.post('/api/backup', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 10. RELATÓRIOS
+// 14. RELATÓRIOS
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/relatorio', authMiddleware, async (req, res) => {
@@ -1179,36 +1477,43 @@ app.get('/api/relatorio', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 11. EXPORTAR RELATÓRIO EM EXCEL
+// 15. EXPORTAR RELATÓRIO
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/relatorio/exportar', authMiddleware, async (req, res) => {
     try {
-        const { data_inicio, data_fim } = req.query;
+        const { data_inicio, data_fim, unidade } = req.query;
 
         let filtro = 'WHERE 1=1';
         let params = [];
 
         if (data_inicio) {
-            filtro += ' AND DATE(data_cadastro) >= ?';
+            filtro += ' AND DATE(m.data_cadastro) >= ?';
             params.push(data_inicio);
         }
         if (data_fim) {
-            filtro += ' AND DATE(data_cadastro) <= ?';
+            filtro += ' AND DATE(m.data_cadastro) <= ?';
             params.push(data_fim);
+        }
+        if (unidade) {
+            filtro += ' AND c.unidade = ?';
+            params.push(unidade);
         }
 
         const movimentos = await dbAll(
             `SELECT 
-                requisicao as 'Requisição',
-                data_cadastro as 'Data',
-                usuario as 'Usuário',
-                valor as 'Valor',
-                tipo_transacao as 'Tipo',
-                forma_pagamento as 'Forma Pagamento',
-                descricao_transacao as 'Descrição',
-                posto_coleta as 'Unidade/Posto'
-             FROM movimentos ${filtro} ORDER BY data_cadastro DESC`,
+                m.requisicao as 'Requisição',
+                m.data_cadastro as 'Data',
+                m.usuario as 'Usuário',
+                m.valor as 'Valor',
+                m.tipo_transacao as 'Tipo',
+                m.forma_pagamento as 'Forma Pagamento',
+                m.descricao_transacao as 'Descrição',
+                m.posto_coleta as 'Posto',
+                c.unidade as 'Unidade'
+             FROM movimentos m
+             INNER JOIN caixa_controle c ON m.id_caixa = c.id
+             ${filtro} ORDER BY m.data_cadastro DESC`,
             params
         );
 
@@ -1237,7 +1542,7 @@ app.get('/api/relatorio/exportar', authMiddleware, async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────
-// 12. AUDITORIA
+// 16. AUDITORIA
 // ───────────────────────────────────────────────────────────────────────
 
 app.get('/api/auditoria', authMiddleware, async (req, res) => {
@@ -1281,10 +1586,9 @@ app.get('/api/auditoria', authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// ✅ TRATAMENTO DE ERROS 404 E 500 (SEMPRE RETORNA JSON)
+// TRATAMENTO DE ERROS
 // ═══════════════════════════════════════════════════════════════════════
 
-// 404 - Rota não encontrada
 app.use((req, res) => {
     res.status(404).json({
         erro: true,
@@ -1293,6 +1597,9 @@ app.use((req, res) => {
             'POST /api/caixa/abrir',
             'POST /api/caixa/fechar',
             'GET /api/caixa/status',
+            'GET /api/caixa/unidade/:unidade',
+            'GET /api/caixa/fechados',
+            'GET /api/lancamentos/unidade/:unidade',
             'POST /api/movimento',
             'GET /api/movimentos',
             'PUT /api/movimento/:id',
@@ -1307,11 +1614,9 @@ app.use((req, res) => {
     });
 });
 
-// 500 - Erro interno do servidor
 app.use((err, req, res, next) => {
     logger.error('Erro não tratado:', err);
     
-    // Se for erro do Multer
     if (err instanceof multer.MulterError) {
         return res.status(400).json({
             erro: true,
@@ -1321,7 +1626,6 @@ app.use((err, req, res, next) => {
         });
     }
     
-    // Outros erros
     res.status(500).json({
         erro: true,
         mensagem: err.message || 'Erro interno do servidor',
@@ -1331,7 +1635,7 @@ app.use((err, req, res, next) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// AGENDAMENTOS (CRON)
+// AGENDAMENTOS
 // ═══════════════════════════════════════════════════════════════════════
 
 cron.schedule('0 0 * * 3', async () => {
@@ -1369,7 +1673,7 @@ app.listen(PORT, () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                                                                       ║
-║   🚀 SISTEMA DE CONTROLE DE CAIXA V5.4 - DATAS + CLEANUP            ║
+║   🚀 SISTEMA DE CONTROLE DE CAIXA V5.5 - APIs POR UNIDADE           ║
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
@@ -1380,15 +1684,17 @@ app.listen(PORT, () => {
 ║                                                                       ║
 ╠═══════════════════════════════════════════════════════════════════════╣
 ║                                                                       ║
-║   ✅ CORREÇÕES V5.4:                                                 ║
-║   • Datas DD/MM/YYYY convertidas corretamente                        ║
-║   • Anti-duplicata na importação                                     ║
-║   • POST /api/cleanup remove duplicatas existentes                   ║
-║   • Migration: coluna detalhes na auditoria                          ║
-║   • Saldo = Inicial + CRÉDITO - DÉBITO                               ║
+║   ✅ NOVIDADES V5.5:                                                 ║
+║   • GET /api/lancamentos/unidade/:unidade                            ║
+║   • GET /api/caixa/fechados (com lançamentos)                        ║
+║   • GET /api/caixa/unidade/:unidade                                  ║
+║   • Abertura de caixa exige unidade                                  ║
+║   • Importação usa data ORIGINAL dos lançamentos                     ║
+║   • Controle de duplicatas melhorado                                 ║
 ║                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════╝
     `);
     
-    logger.info('✅ Sistema V5.4 iniciado - Datas + Cleanup!');
+    logger.info('✅ Sistema V5.5 iniciado - APIs por Unidade!');
 });
+
