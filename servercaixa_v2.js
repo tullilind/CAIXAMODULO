@@ -1771,8 +1771,3 @@ app.listen(PORT, () => {
     
     logger.info('✅ Sistema V5.7 iniciado - Todas as correções aplicadas!');
 });
-    
-    logger.info('✅ Sistema V5.6 iniciado - Data Customizada na Abertura!');
-});
-
-
